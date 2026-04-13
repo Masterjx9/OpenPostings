@@ -135,7 +135,7 @@ MCP helper endpoints:
 
 You can have Codex/Claude/Gemini/Qwen/LLMs do the following for you:
 - Get your applicantee information `get_applicant_context`
-- Find the latest relevent jobs for you. `find_posting_candidates`
+- Find the latest relevant jobs for you. `find_posting_candidates`
 - Apply to those jobs (As long as your LLM model has access to a browser)
 - Build a dynamic cover letter for you that relates to your resume, experience and the job you are applying for. `draft_cover_letter`
 - Update job application tracking for you. `record_application_result`
