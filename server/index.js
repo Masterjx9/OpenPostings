@@ -7,12 +7,25 @@ const sqlite3 = require("sqlite3");
 const PORT = Number(process.env.PORT || 8787);
 const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, "..", "jobs.db");
 const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS || 10 * 60 * 1000);
+const SYNC_WORKER_CONCURRENCY_RAW = Number(process.env.SYNC_WORKER_CONCURRENCY || 4);
+const SYNC_WORKER_CONCURRENCY =
+  Number.isFinite(SYNC_WORKER_CONCURRENCY_RAW) && SYNC_WORKER_CONCURRENCY_RAW > 0
+    ? Math.floor(SYNC_WORKER_CONCURRENCY_RAW)
+    : 4;
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 12000);
+const ATS_REQUEST_QUEUE_CONCURRENCY_RAW = Number(process.env.ATS_REQUEST_QUEUE_CONCURRENCY || 1);
+const ATS_REQUEST_QUEUE_CONCURRENCY_DEFAULT =
+  Number.isFinite(ATS_REQUEST_QUEUE_CONCURRENCY_RAW) && ATS_REQUEST_QUEUE_CONCURRENCY_RAW > 0
+    ? Math.floor(ATS_REQUEST_QUEUE_CONCURRENCY_RAW)
+    : 1;
+const MIN_ATS_REQUEST_QUEUE_CONCURRENCY = 1;
+const MAX_ATS_REQUEST_QUEUE_CONCURRENCY = 20;
 const POSTING_TTL_SECONDS = Number(process.env.POSTING_TTL_SECONDS || 24 * 60 * 60);
 const WORKDAY_PAGE_SIZE = 20;
 const ULTIPRO_PAGE_SIZE = 50;
 const MAX_PAGES_PER_COMPANY = 25;
 const LOCALE_SEGMENT_REGEX = /^[a-z]{2}(?:-[a-z]{2})?$/i;
+const WORKDAY_RATE_LIMIT_WAIT_MS = 60 * 1000;
 const ASHBY_API_URL = "https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobBoardWithTeams";
 const ASHBY_RATE_LIMIT_WAIT_MS = 60 * 1000;
 const GREENHOUSE_API_URL_BASE = "https://boards-api.greenhouse.io/v1/boards";
@@ -70,6 +83,8 @@ let wordIndustryCoverageCache = null;
 let phraseNgramIndustryCoverageCache = null;
 let syncPromise = null;
 let postingLocationByJobUrl = new Map();
+const atsRateLimitStateByKey = new Map();
+let atsRequestQueueConcurrency = ATS_REQUEST_QUEUE_CONCURRENCY_DEFAULT;
 const syncStatus = {
   running: false,
   started_at: null,
@@ -342,6 +357,9 @@ const MCP_SETTINGS_DEFAULTS = {
   preferred_states: [],
   preferred_counties: [],
   instructions_for_agent: ""
+};
+const SYNC_SERVICE_SETTINGS_DEFAULTS = {
+  ats_request_queue_concurrency: ATS_REQUEST_QUEUE_CONCURRENCY_DEFAULT
 };
 const PHRASE_NGRAM_INDUSTRY_COVERAGE_THRESHOLD = 2;
 const FALLBACK_WORD_INDUSTRY_COVERAGE_THRESHOLD = 2;
@@ -945,6 +963,28 @@ function createDefaultPersonalInformation() {
 function parseNonNegativeInteger(value) {
   const parsed = Number.parseInt(String(value ?? "").trim(), 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function parsePositiveInteger(value) {
+  const parsed = Number.parseInt(String(value ?? "").trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function normalizeAtsRequestQueueConcurrency(value, fallbackValue = ATS_REQUEST_QUEUE_CONCURRENCY_DEFAULT) {
+  const fallback = parsePositiveInteger(fallbackValue) || ATS_REQUEST_QUEUE_CONCURRENCY_DEFAULT;
+  const parsed = parsePositiveInteger(value) || fallback;
+  return Math.max(MIN_ATS_REQUEST_QUEUE_CONCURRENCY, Math.min(MAX_ATS_REQUEST_QUEUE_CONCURRENCY, parsed));
+}
+
+function normalizeSyncServiceSettingsInput(value = {}, fallback = SYNC_SERVICE_SETTINGS_DEFAULTS) {
+  const source = value && typeof value === "object" ? value : {};
+  const fallbackConcurrency = normalizeAtsRequestQueueConcurrency(fallback?.ats_request_queue_concurrency);
+  return {
+    ats_request_queue_concurrency: normalizeAtsRequestQueueConcurrency(
+      source.ats_request_queue_concurrency,
+      fallbackConcurrency
+    )
+  };
 }
 
 function normalizePersonalInformationInput(value) {
@@ -2133,363 +2173,332 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWorkdayPage(cxsUrl, limit, offset) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(cxsUrl, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        appliedFacets: {},
-        limit,
-        offset,
-        searchText: ""
-      }),
-      signal: controller.signal
-    });
+function toAtsRateLimitKey(value) {
+  const key = String(value || "").trim().toLowerCase();
+  return key || "default";
+}
 
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Workday request failed (${res.status}): ${body.slice(0, 180)}`);
-    }
-
-    return res.json();
-  } finally {
-    clearTimeout(timeout);
+function getAtsRateLimitState(rateLimitKey) {
+  const normalizedKey = toAtsRateLimitKey(rateLimitKey);
+  let state = atsRateLimitStateByKey.get(normalizedKey);
+  if (!state) {
+    state = {
+      active: 0,
+      queue: [],
+      blockedUntilEpochMs: 0
+    };
+    atsRateLimitStateByKey.set(normalizedKey, state);
   }
+  return state;
+}
+
+function parseRetryAfterMilliseconds(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.max(0, Math.ceil(seconds * 1000));
+  }
+
+  const parsedEpochMs = Date.parse(raw);
+  if (!Number.isFinite(parsedEpochMs)) return null;
+  return Math.max(0, parsedEpochMs - Date.now());
+}
+
+function resolveAtsRateLimitWaitMs(res, fallbackWaitMs) {
+  const minimumWaitMs = Math.max(0, Number(fallbackWaitMs || 0));
+  const retryAfterMs = parseRetryAfterMilliseconds(res?.headers?.get("retry-after"));
+  if (!Number.isFinite(retryAfterMs)) return minimumWaitMs;
+  return Math.max(minimumWaitMs, retryAfterMs);
+}
+
+async function acquireAtsRequestSlot(rateLimitKey) {
+  const state = getAtsRateLimitState(rateLimitKey);
+  if (state.active < atsRequestQueueConcurrency) {
+    state.active += 1;
+    return;
+  }
+  await new Promise((resolve) => {
+    state.queue.push(resolve);
+  });
+}
+
+function releaseAtsRequestSlot(rateLimitKey) {
+  const state = getAtsRateLimitState(rateLimitKey);
+  const next = state.queue.shift();
+  if (typeof next === "function") {
+    next();
+    return;
+  }
+  state.active = Math.max(0, state.active - 1);
+}
+
+function markAtsRateLimited(rateLimitKey, waitMs) {
+  const state = getAtsRateLimitState(rateLimitKey);
+  const ms = Math.max(0, Number(waitMs || 0));
+  state.blockedUntilEpochMs = Math.max(state.blockedUntilEpochMs, Date.now() + ms);
+}
+
+async function waitForAtsCooldown(rateLimitKey) {
+  const state = getAtsRateLimitState(rateLimitKey);
+  while (true) {
+    const waitMs = Number(state.blockedUntilEpochMs || 0) - Date.now();
+    if (waitMs <= 0) return;
+    await sleep(waitMs);
+  }
+}
+
+async function fetchWithAtsRateLimit(rateLimitKey, fallbackWaitMs, url, init = {}) {
+  while (true) {
+    await acquireAtsRequestSlot(rateLimitKey);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      await waitForAtsCooldown(rateLimitKey);
+      const res = await fetch(url, {
+        ...init,
+        signal: controller.signal
+      });
+
+      if (res.status === 429) {
+        markAtsRateLimited(rateLimitKey, resolveAtsRateLimitWaitMs(res, fallbackWaitMs));
+        continue;
+      }
+
+      return res;
+    } finally {
+      clearTimeout(timeout);
+      releaseAtsRequestSlot(rateLimitKey);
+    }
+  }
+}
+
+async function fetchWorkdayPage(cxsUrl, limit, offset) {
+  const res = await fetchWithAtsRateLimit("workday", WORKDAY_RATE_LIMIT_WAIT_MS, cxsUrl, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      appliedFacets: {},
+      limit,
+      offset,
+      searchText: ""
+    })
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Workday request failed (${res.status}): ${body.slice(0, 180)}`);
+  }
+
+  return res.json();
 }
 
 async function fetchAshbyJobBoard(organizationHostedJobsPageName) {
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(ASHBY_API_URL, {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          operationName: "ApiJobBoardWithTeams",
-          variables: {
-            organizationHostedJobsPageName
-          },
-          query: ASHBY_QUERY
-        }),
-        signal: controller.signal
-      });
+  const res = await fetchWithAtsRateLimit("ashby", ASHBY_RATE_LIMIT_WAIT_MS, ASHBY_API_URL, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      operationName: "ApiJobBoardWithTeams",
+      variables: {
+        organizationHostedJobsPageName
+      },
+      query: ASHBY_QUERY
+    })
+  });
 
-      if (res.status === 429) {
-        await sleep(ASHBY_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`Ashby request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      const data = await res.json();
-      if (Array.isArray(data?.errors) && data.errors.length > 0) {
-        const firstError = String(data.errors[0]?.message || "Unknown Ashby GraphQL error");
-        throw new Error(`Ashby GraphQL error: ${firstError}`);
-      }
-
-      return data;
-    } finally {
-      clearTimeout(timeout);
-    }
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Ashby request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  const data = await res.json();
+  if (Array.isArray(data?.errors) && data.errors.length > 0) {
+    const firstError = String(data.errors[0]?.message || "Unknown Ashby GraphQL error");
+    throw new Error(`Ashby GraphQL error: ${firstError}`);
+  }
+
+  return data;
 }
 
 async function fetchGreenhouseJobBoard(boardToken) {
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const encodedBoardToken = encodeURIComponent(boardToken);
-      const res = await fetch(`${GREENHOUSE_API_URL_BASE}/${encodedBoardToken}/jobs?content=true`, {
-        method: "GET",
-        headers: {
-          Accept: "application/json"
-        },
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(GREENHOUSE_RATE_LIMIT_WAIT_MS);
-        continue;
+  const encodedBoardToken = encodeURIComponent(boardToken);
+  const res = await fetchWithAtsRateLimit(
+    "greenhouse",
+    GREENHOUSE_RATE_LIMIT_WAIT_MS,
+    `${GREENHOUSE_API_URL_BASE}/${encodedBoardToken}/jobs?content=true`,
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json"
       }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`Greenhouse request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.json();
-    } finally {
-      clearTimeout(timeout);
     }
+  );
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Greenhouse request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  return res.json();
 }
 
 async function fetchLeverJobBoard(organization) {
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const encodedOrganization = encodeURIComponent(organization);
-      const res = await fetch(`${LEVER_API_URL_BASE}/${encodedOrganization}?mode=json`, {
-        method: "GET",
-        headers: {
-          Accept: "application/json"
-        },
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(LEVER_RATE_LIMIT_WAIT_MS);
-        continue;
+  const encodedOrganization = encodeURIComponent(organization);
+  const res = await fetchWithAtsRateLimit(
+    "lever",
+    LEVER_RATE_LIMIT_WAIT_MS,
+    `${LEVER_API_URL_BASE}/${encodedOrganization}?mode=json`,
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json"
       }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`Lever request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.json();
-    } finally {
-      clearTimeout(timeout);
     }
+  );
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Lever request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  return res.json();
 }
 
 async function fetchRecruiteePublicApp(baseUrl) {
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(baseUrl, {
-        method: "GET",
-        headers: {
-          Accept: "text/html,application/xhtml+xml"
-        },
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(RECRUITEE_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`Recruitee request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      const pageHtml = await res.text();
-      const props = extractRecruiteePropsFromHtml(pageHtml);
-      if (!props) {
-        throw new Error("Recruitee payload not found in PublicApp data-props");
-      }
-      return props;
-    } finally {
-      clearTimeout(timeout);
+  const res = await fetchWithAtsRateLimit("recruitee", RECRUITEE_RATE_LIMIT_WAIT_MS, baseUrl, {
+    method: "GET",
+    headers: {
+      Accept: "text/html,application/xhtml+xml"
     }
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Recruitee request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  const pageHtml = await res.text();
+  const props = extractRecruiteePropsFromHtml(pageHtml);
+  if (!props) {
+    throw new Error("Recruitee payload not found in PublicApp data-props");
+  }
+  return props;
 }
 
 async function fetchJobviteJobsPage(jobsUrl) {
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(jobsUrl, {
-        method: "GET",
-        headers: {
-          Accept: "text/html,application/xhtml+xml"
-        },
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(JOBVITE_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`Jobvite request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.text();
-    } finally {
-      clearTimeout(timeout);
+  const res = await fetchWithAtsRateLimit("jobvite", JOBVITE_RATE_LIMIT_WAIT_MS, jobsUrl, {
+    method: "GET",
+    headers: {
+      Accept: "text/html,application/xhtml+xml"
     }
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Jobvite request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  return res.text();
 }
 
 async function fetchApplicantProJobsPage(jobsUrl) {
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(jobsUrl, {
-        method: "GET",
-        headers: {
-          Accept: "text/html,application/xhtml+xml"
-        },
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(APPLICANTPRO_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`ApplicantPro page request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.text();
-    } finally {
-      clearTimeout(timeout);
+  const res = await fetchWithAtsRateLimit("applicantpro", APPLICANTPRO_RATE_LIMIT_WAIT_MS, jobsUrl, {
+    method: "GET",
+    headers: {
+      Accept: "text/html,application/xhtml+xml"
     }
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`ApplicantPro page request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  return res.text();
 }
 
 async function fetchApplicantProJobsList(config, domainId) {
   const apiUrl = new URL(`${String(config?.origin || "").replace(/\/+$/, "")}/core/jobs/${encodeURIComponent(domainId)}`);
   apiUrl.searchParams.set("getParams", "{}");
 
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(apiUrl.toString(), {
-        method: "GET",
-        headers: {
-          Accept: "application/json"
-        },
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(APPLICANTPRO_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`ApplicantPro jobs request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      const payload = await res.json();
-      if (payload && typeof payload === "object" && payload.success === false) {
-        const message = String(payload?.message || "Unknown ApplicantPro API error");
-        throw new Error(`ApplicantPro jobs API returned success=false: ${message}`);
-      }
-      return payload;
-    } finally {
-      clearTimeout(timeout);
+  const res = await fetchWithAtsRateLimit("applicantpro", APPLICANTPRO_RATE_LIMIT_WAIT_MS, apiUrl.toString(), {
+    method: "GET",
+    headers: {
+      Accept: "application/json"
     }
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`ApplicantPro jobs request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  const payload = await res.json();
+  if (payload && typeof payload === "object" && payload.success === false) {
+    const message = String(payload?.message || "Unknown ApplicantPro API error");
+    throw new Error(`ApplicantPro jobs API returned success=false: ${message}`);
+  }
+  return payload;
 }
 
 async function fetchApplyToJobPage(applyUrl) {
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(applyUrl, {
-        method: "GET",
-        headers: {
-          Accept: "text/html,application/xhtml+xml"
-        },
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(APPLYTOJOB_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`ApplyToJob page request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.text();
-    } finally {
-      clearTimeout(timeout);
+  const res = await fetchWithAtsRateLimit("applytojob", APPLYTOJOB_RATE_LIMIT_WAIT_MS, applyUrl, {
+    method: "GET",
+    headers: {
+      Accept: "text/html,application/xhtml+xml"
     }
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`ApplyToJob page request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  return res.text();
 }
 
 async function fetchTheApplicantManagerPage(careersUrl) {
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(careersUrl, {
-        method: "GET",
-        headers: {
-          Accept: "text/html,application/xhtml+xml"
-        },
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(THEAPPLICANTMANAGER_RATE_LIMIT_WAIT_MS);
-        continue;
+  const res = await fetchWithAtsRateLimit(
+    "theapplicantmanager",
+    THEAPPLICANTMANAGER_RATE_LIMIT_WAIT_MS,
+    careersUrl,
+    {
+      method: "GET",
+      headers: {
+        Accept: "text/html,application/xhtml+xml"
       }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`TheApplicantManager page request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.text();
-    } finally {
-      clearTimeout(timeout);
     }
+  );
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`TheApplicantManager page request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  return res.text();
 }
 
 async function fetchIcimsPage(urlString) {
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(urlString, {
-        method: "GET",
-        headers: {
-          Accept: "text/html,application/xhtml+xml"
-        },
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(ICIMS_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`iCIMS page request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.text();
-    } finally {
-      clearTimeout(timeout);
+  const res = await fetchWithAtsRateLimit("icims", ICIMS_RATE_LIMIT_WAIT_MS, urlString, {
+    method: "GET",
+    headers: {
+      Accept: "text/html,application/xhtml+xml"
     }
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`iCIMS page request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  return res.text();
 }
 
 function buildUltiProSearchPayload(top, skip) {
@@ -2529,65 +2538,37 @@ async function fetchUltiProSearchResults(config, top, skip) {
   const apiUrl = `https://recruiting.ultipro.com/${tenantEncoded}/JobBoard/${boardIdEncoded}/JobBoardView/LoadSearchResults`;
   const payload = buildUltiProSearchPayload(top, skip);
 
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(apiUrl, {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal
-      });
+  const res = await fetchWithAtsRateLimit("ultipro", ULTIPRO_RATE_LIMIT_WAIT_MS, apiUrl, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
 
-      if (res.status === 429) {
-        await sleep(ULTIPRO_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`UltiPro request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.json();
-    } finally {
-      clearTimeout(timeout);
-    }
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`UltiPro request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  return res.json();
 }
 
 async function fetchTaleoJobSearchPage(urlString) {
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(urlString, {
-        method: "GET",
-        headers: {
-          Accept: "text/html,application/xhtml+xml"
-        },
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(TALEO_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`Taleo page request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.text();
-    } finally {
-      clearTimeout(timeout);
+  const res = await fetchWithAtsRateLimit("taleo", TALEO_RATE_LIMIT_WAIT_MS, urlString, {
+    method: "GET",
+    headers: {
+      Accept: "text/html,application/xhtml+xml"
     }
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Taleo page request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  return res.text();
 }
 
 async function fetchTaleoRestSearchResults(config, portal, tokenName, tokenValue, pageNo) {
@@ -2596,81 +2577,53 @@ async function fetchTaleoRestSearchResults(config, portal, tokenName, tokenValue
   )}&portal=${encodeURIComponent(portal)}`;
   const payload = buildTaleoRestPayload(pageNo);
 
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const headers = {
-        Accept: "application/json, text/javascript, */*; q=0.01",
-        "Content-Type": "application/json",
-        "x-requested-with": "XMLHttpRequest",
-        tz: "GMT-07:00",
-        tzname: "America/Los_Angeles"
-      };
-      if (tokenName && tokenValue) {
-        headers[tokenName] = tokenValue;
-      }
-
-      const res = await fetch(apiUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: controller.signal
-      });
-
-      if (res.status === 429) {
-        await sleep(TALEO_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`Taleo REST request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.json();
-    } finally {
-      clearTimeout(timeout);
-    }
+  const headers = {
+    Accept: "application/json, text/javascript, */*; q=0.01",
+    "Content-Type": "application/json",
+    "x-requested-with": "XMLHttpRequest",
+    tz: "GMT-07:00",
+    tzname: "America/Los_Angeles"
+  };
+  if (tokenName && tokenValue) {
+    headers[tokenName] = tokenValue;
   }
+
+  const res = await fetchWithAtsRateLimit("taleo", TALEO_RATE_LIMIT_WAIT_MS, apiUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Taleo REST request failed (${res.status}): ${body.slice(0, 180)}`);
+  }
+
+  return res.json();
 }
 
 async function fetchTaleoAjaxSearchResults(config, csrfToken = "") {
   const apiUrl = `${config.baseSectionUrl}/jobsearch.ajax`;
   const payload = new URLSearchParams(buildTaleoAjaxPayload(config.lang, csrfToken)).toString();
 
-  while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(apiUrl, {
-        method: "POST",
-        headers: {
-          Accept: "*/*",
-          "Content-Type": "application/x-www-form-urlencoded",
-          "x-requested-with": "XMLHttpRequest",
-          tz: "GMT-07:00",
-          tzname: "America/Los_Angeles"
-        },
-        body: payload,
-        signal: controller.signal
-      });
+  const res = await fetchWithAtsRateLimit("taleo", TALEO_RATE_LIMIT_WAIT_MS, apiUrl, {
+    method: "POST",
+    headers: {
+      Accept: "*/*",
+      "Content-Type": "application/x-www-form-urlencoded",
+      "x-requested-with": "XMLHttpRequest",
+      tz: "GMT-07:00",
+      tzname: "America/Los_Angeles"
+    },
+    body: payload
+  });
 
-      if (res.status === 429) {
-        await sleep(TALEO_RATE_LIMIT_WAIT_MS);
-        continue;
-      }
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`Taleo AJAX request failed (${res.status}): ${body.slice(0, 180)}`);
-      }
-
-      return res.text();
-    } finally {
-      clearTimeout(timeout);
-    }
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Taleo AJAX request failed (${res.status}): ${body.slice(0, 180)}`);
   }
+
+  return res.text();
 }
 
 async function collectTodayPostingsForWorkdayCompany(company) {
@@ -3193,6 +3146,8 @@ async function initDb() {
   await ensurePostingsTable();
   await ensurePersonalInformationTable();
   await ensureApplicationsTable();
+  await ensureSyncServiceSettingsTable();
+  await loadSyncServiceSettingsIntoRuntime();
   await ensureCompaniesTableSchema();
 }
 
@@ -3428,6 +3383,86 @@ async function ensureApplicationsTable() {
       ADD COLUMN agent_login_password TEXT NOT NULL DEFAULT '';
     `);
   }
+}
+
+async function ensureSyncServiceSettingsTable() {
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS SyncServiceSettings (
+      id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+      ats_request_queue_concurrency INTEGER NOT NULL DEFAULT 1,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  await db.run(
+    `
+      INSERT INTO SyncServiceSettings (
+        id,
+        ats_request_queue_concurrency,
+        updated_at
+      ) VALUES (1, ?, datetime('now'))
+      ON CONFLICT(id) DO NOTHING;
+    `,
+    [SYNC_SERVICE_SETTINGS_DEFAULTS.ats_request_queue_concurrency]
+  );
+}
+
+async function getStoredSyncServiceSettings() {
+  const row = await db.get(
+    `
+      SELECT
+        ats_request_queue_concurrency
+      FROM SyncServiceSettings
+      WHERE id = 1
+      LIMIT 1;
+    `
+  );
+
+  return normalizeSyncServiceSettingsInput(
+    {
+      ...SYNC_SERVICE_SETTINGS_DEFAULTS,
+      ats_request_queue_concurrency: row?.ats_request_queue_concurrency
+    },
+    SYNC_SERVICE_SETTINGS_DEFAULTS
+  );
+}
+
+async function loadSyncServiceSettingsIntoRuntime() {
+  const stored = await getStoredSyncServiceSettings();
+  atsRequestQueueConcurrency = normalizeAtsRequestQueueConcurrency(stored?.ats_request_queue_concurrency);
+  return stored;
+}
+
+async function getSyncServiceSettings() {
+  const stored = await getStoredSyncServiceSettings();
+  return {
+    ...stored,
+    active_ats_request_queue_concurrency: atsRequestQueueConcurrency,
+    min_ats_request_queue_concurrency: MIN_ATS_REQUEST_QUEUE_CONCURRENCY,
+    max_ats_request_queue_concurrency: MAX_ATS_REQUEST_QUEUE_CONCURRENCY,
+    applies_after_service_restart: true
+  };
+}
+
+async function upsertSyncServiceSettings(input = {}) {
+  const existing = await getStoredSyncServiceSettings();
+  const normalized = normalizeSyncServiceSettingsInput(input, existing);
+
+  await db.run(
+    `
+      INSERT INTO SyncServiceSettings (
+        id,
+        ats_request_queue_concurrency,
+        updated_at
+      ) VALUES (1, ?, datetime('now'))
+      ON CONFLICT(id) DO UPDATE SET
+        ats_request_queue_concurrency = excluded.ats_request_queue_concurrency,
+        updated_at = datetime('now');
+    `,
+    [normalized.ats_request_queue_concurrency]
+  );
+
+  return getSyncServiceSettings();
 }
 
 async function getMcpSettings() {
@@ -4483,41 +4518,54 @@ async function runWorkdaySyncInternal() {
     const dedupedPostings = new Map();
     const errors = [];
     let excludedByPostingDate = 0;
+    let nextCompanyIndex = 0;
+    let completedCompanies = 0;
+    const workerCount = Math.min(SYNC_WORKER_CONCURRENCY, Math.max(1, companies.length));
 
-    for (let i = 0; i < companies.length; i += 1) {
-      const company = companies[i];
-      try {
-        const postings = await collectPostingsForCompany(company);
-        const uniqueCompanyPostings = [];
-        for (const posting of postings) {
-          if (!shouldStorePostingByDate(posting?.posting_date, syncReferenceEpoch)) {
-            excludedByPostingDate += 1;
-            continue;
+    const runSyncWorker = async () => {
+      while (true) {
+        const currentIndex = nextCompanyIndex;
+        if (currentIndex >= companies.length) return;
+        nextCompanyIndex += 1;
+
+        const company = companies[currentIndex];
+        try {
+          const postings = await collectPostingsForCompany(company);
+          for (const posting of postings) {
+            if (!shouldStorePostingByDate(posting?.posting_date, syncReferenceEpoch)) {
+              excludedByPostingDate += 1;
+              continue;
+            }
+            if (dedupedPostings.has(posting.job_posting_url)) continue;
+            dedupedPostings.set(posting.job_posting_url, posting);
+            const location = String(posting?.location || "").trim();
+            if (location) {
+              nextPostingLocationByJobUrl.set(posting.job_posting_url, location);
+              postingLocationByJobUrl.set(posting.job_posting_url, location);
+            }
           }
-          if (dedupedPostings.has(posting.job_posting_url)) continue;
-          dedupedPostings.set(posting.job_posting_url, posting);
-          const location = String(posting?.location || "").trim();
-          if (location) {
-            nextPostingLocationByJobUrl.set(posting.job_posting_url, location);
-            postingLocationByJobUrl.set(posting.job_posting_url, location);
-          }
-          uniqueCompanyPostings.push(posting);
+        } catch (error) {
+          errors.push({
+            company_name: company.company_name,
+            message: String(error?.message || error)
+          });
+        } finally {
+          completedCompanies += 1;
+          syncStatus.progress = {
+            current: completedCompanies,
+            total: companies.length,
+            company_name: `${company.company_name} (${company.ATS_name})`,
+            total_collected: dedupedPostings.size
+          };
         }
-        await upsertPostings(uniqueCompanyPostings, syncReferenceEpoch);
-      } catch (error) {
-        errors.push({
-          company_name: company.company_name,
-          message: String(error?.message || error)
-        });
-      } finally {
-        syncStatus.progress = {
-          current: i + 1,
-          total: companies.length,
-          company_name: `${company.company_name} (${company.ATS_name})`,
-          total_collected: dedupedPostings.size
-        };
       }
+    };
+
+    if (companies.length > 0) {
+      await Promise.all(Array.from({ length: workerCount }, () => runSyncWorker()));
     }
+
+    await upsertPostings(Array.from(dedupedPostings.values()), syncReferenceEpoch);
 
     totalPruned += await pruneExpiredPostings(syncReferenceEpoch);
     postingDatePruned += await prunePostingsOutsideDateWindow(syncReferenceEpoch);
@@ -4527,6 +4575,8 @@ async function runWorkdaySyncInternal() {
     syncStatus.last_sync_summary = {
       total_companies: companies.length,
       total_postings_stored: dedupedPostings.size,
+      worker_concurrency: workerCount,
+      ats_request_queue_concurrency: atsRequestQueueConcurrency,
       failed_companies: errors.length,
       expired_pruned: totalPruned,
       posting_date_pruned: postingDatePruned,
@@ -4758,6 +4808,19 @@ function createServer() {
 
   app.put("/settings/mcp", async (req, res) => {
     const item = await upsertMcpSettings(req.body || {});
+    res.json({
+      ok: true,
+      item
+    });
+  });
+
+  app.get("/settings/sync", async (_req, res) => {
+    const item = await getSyncServiceSettings();
+    res.json({ item });
+  });
+
+  app.put("/settings/sync", async (req, res) => {
+    const item = await upsertSyncServiceSettings(req.body || {});
     res.json({
       ok: true,
       item
@@ -5091,6 +5154,9 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`[OpenPostings API] listening on http://localhost:${PORT}`);
     console.log(`[OpenPostings API] using database ${DB_PATH}`);
+    console.log(
+      `[OpenPostings API] ATS request queue concurrency (runtime): ${atsRequestQueueConcurrency} (saved changes apply after restart)`
+    );
   });
 
   runWorkdaySync().catch((error) => {

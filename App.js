@@ -25,10 +25,12 @@ import {
   fetchPostingFilterOptions,
   fetchPersonalInformation,
   fetchPostings,
+  fetchSyncServiceSettings,
   fetchSyncStatus,
   ignorePosting,
   saveMcpSettings,
   savePersonalInformation,
+  saveSyncServiceSettings,
   triggerWorkdaySync,
   updateApplicationStatus
 } from "./src/api";
@@ -60,6 +62,9 @@ const APPLICATION_STATUS_OPTIONS = [
 const DEFAULT_SYNC_INTERVAL_SECONDS = 3600;
 const MIN_SYNC_INTERVAL_SECONDS = 60;
 const MAX_SYNC_INTERVAL_SECONDS = 24 * 60 * 60;
+const DEFAULT_ATS_REQUEST_QUEUE_CONCURRENCY = 1;
+const MIN_ATS_REQUEST_QUEUE_CONCURRENCY = 1;
+const MAX_ATS_REQUEST_QUEUE_CONCURRENCY = 20;
 const DEFAULT_ATS_FILTER_OPTIONS = [
   { value: "workday", label: "Workday" },
   { value: "ashby", label: "Ashby" },
@@ -154,6 +159,43 @@ function formatSyncIntervalLabel(seconds) {
     return `${minutes} minute${minutes === 1 ? "" : "s"}`;
   }
   return `${value} seconds`;
+}
+
+function normalizeAtsRequestQueueConcurrency(value) {
+  const parsed = Number.parseInt(String(value || "").trim(), 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_ATS_REQUEST_QUEUE_CONCURRENCY;
+  if (parsed < MIN_ATS_REQUEST_QUEUE_CONCURRENCY) return MIN_ATS_REQUEST_QUEUE_CONCURRENCY;
+  if (parsed > MAX_ATS_REQUEST_QUEUE_CONCURRENCY) return MAX_ATS_REQUEST_QUEUE_CONCURRENCY;
+  return parsed;
+}
+
+function createDefaultSyncServiceSettings() {
+  return {
+    ats_request_queue_concurrency: String(DEFAULT_ATS_REQUEST_QUEUE_CONCURRENCY),
+    active_ats_request_queue_concurrency: String(DEFAULT_ATS_REQUEST_QUEUE_CONCURRENCY),
+    min_ats_request_queue_concurrency: MIN_ATS_REQUEST_QUEUE_CONCURRENCY,
+    max_ats_request_queue_concurrency: MAX_ATS_REQUEST_QUEUE_CONCURRENCY,
+    applies_after_service_restart: true
+  };
+}
+
+function toFormSyncServiceSettings(value) {
+  const defaults = createDefaultSyncServiceSettings();
+  const source = value && typeof value === "object" ? value : {};
+  const configured = normalizeAtsRequestQueueConcurrency(source.ats_request_queue_concurrency);
+  const active = normalizeAtsRequestQueueConcurrency(
+    source.active_ats_request_queue_concurrency ?? configured
+  );
+  const minValue = normalizeAtsRequestQueueConcurrency(source.min_ats_request_queue_concurrency || defaults.min_ats_request_queue_concurrency);
+  const maxValue = normalizeAtsRequestQueueConcurrency(source.max_ats_request_queue_concurrency || defaults.max_ats_request_queue_concurrency);
+
+  return {
+    ats_request_queue_concurrency: String(configured),
+    active_ats_request_queue_concurrency: String(active),
+    min_ats_request_queue_concurrency: Math.min(minValue, maxValue),
+    max_ats_request_queue_concurrency: Math.max(minValue, maxValue),
+    applies_after_service_restart: source.applies_after_service_restart !== false
+  };
 }
 
 const PERSONAL_INFORMATION_FIELDS = [
@@ -535,6 +577,9 @@ export default function App() {
     wifiOnly: false,
     syncIntervalSeconds: String(DEFAULT_SYNC_INTERVAL_SECONDS)
   });
+  const [syncServiceSettings, setSyncServiceSettings] = useState(createDefaultSyncServiceSettings);
+  const [syncServiceSettingsLoading, setSyncServiceSettingsLoading] = useState(false);
+  const [syncServiceSettingsSaving, setSyncServiceSettingsSaving] = useState(false);
   const [syncSettingsNotice, setSyncSettingsNotice] = useState("");
   const [mcpSettings, setMcpSettings] = useState(createDefaultMcpSettings);
   const [mcpSettingsLoading, setMcpSettingsLoading] = useState(false);
@@ -681,6 +726,23 @@ export default function App() {
     }
   }, []);
 
+  const loadSyncServiceSettings = useCallback(async (options = {}) => {
+    const silent = Boolean(options.silent);
+    if (!silent) {
+      setSyncServiceSettingsLoading(true);
+    }
+    try {
+      const response = await fetchSyncServiceSettings();
+      setSyncServiceSettings(toFormSyncServiceSettings(response?.item));
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      if (!silent) {
+        setSyncServiceSettingsLoading(false);
+      }
+    }
+  }, []);
+
   const runSync = useCallback(async () => {
     setError("");
     try {
@@ -715,11 +777,21 @@ export default function App() {
     }));
   }, []);
 
-  const handleSaveSyncSettings = useCallback(() => {
+  const handleSaveSyncSettings = useCallback(async () => {
+    setError("");
+    setSyncSettingsNotice("");
     const syncIntervalSeconds = normalizeSyncIntervalSeconds(syncSettings.syncIntervalSeconds);
+    const atsRequestQueueConcurrency = normalizeAtsRequestQueueConcurrency(
+      syncServiceSettings.ats_request_queue_concurrency
+    );
+
     setSyncSettings((prev) => ({
       ...prev,
       syncIntervalSeconds: String(syncIntervalSeconds)
+    }));
+    setSyncServiceSettings((prev) => ({
+      ...prev,
+      ats_request_queue_concurrency: String(atsRequestQueueConcurrency)
     }));
 
     const intervalLabel = formatSyncIntervalLabel(syncIntervalSeconds);
@@ -730,8 +802,27 @@ export default function App() {
           : "on any network"
         : "on any network (Wi-Fi-only applies on Android)";
     const statusLabel = syncSettings.autoSyncEnabled ? `enabled every ${intervalLabel} ${networkScope}` : "disabled";
-    setSyncSettingsNotice(`Sync settings saved locally at ${new Date().toLocaleTimeString()}. Auto sync is ${statusLabel}.`);
-  }, [syncSettings]);
+    const localSavedMessage = `Sync settings saved locally at ${new Date().toLocaleTimeString()}. Auto sync is ${statusLabel}.`;
+
+    setSyncServiceSettingsSaving(true);
+    try {
+      const response = await saveSyncServiceSettings({
+        ats_request_queue_concurrency: atsRequestQueueConcurrency
+      });
+      const saved = toFormSyncServiceSettings(response?.item);
+      setSyncServiceSettings(saved);
+      setSyncSettingsNotice(
+        `${localSavedMessage} ATS request queue concurrency saved as ${saved.ats_request_queue_concurrency}. This will take effect next time you stop and restart the sync service.`
+      );
+    } catch (e) {
+      setError(String(e.message || e));
+      setSyncSettingsNotice(
+        `${localSavedMessage} Unable to save ATS request queue concurrency on the server.`
+      );
+    } finally {
+      setSyncServiceSettingsSaving(false);
+    }
+  }, [syncServiceSettings.ats_request_queue_concurrency, syncSettings]);
 
   const handleSaveMcpSettings = useCallback(async () => {
     setError("");
@@ -1018,6 +1109,7 @@ export default function App() {
           loadPostings("", { filters: postingsFiltersRef.current }),
           loadStatus(),
           loadPersonalInformation(),
+          loadSyncServiceSettings(),
           loadMcpSettings(),
           loadPostingFilterOptions(),
           loadApplications()
@@ -1030,7 +1122,15 @@ export default function App() {
     };
 
     bootstrap();
-  }, [loadPostings, loadStatus, loadPersonalInformation, loadMcpSettings, loadPostingFilterOptions, loadApplications]);
+  }, [
+    loadPostings,
+    loadStatus,
+    loadPersonalInformation,
+    loadSyncServiceSettings,
+    loadMcpSettings,
+    loadPostingFilterOptions,
+    loadApplications
+  ]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -1412,10 +1512,40 @@ export default function App() {
           ) : null}
         </View>
 
+        <View style={styles.formGroup}>
+          <Text style={styles.fieldLabel}>ATS request queue concurrency</Text>
+          <TextInput
+            style={styles.textField}
+            value={syncServiceSettings.ats_request_queue_concurrency}
+            onChangeText={(value) =>
+              setSyncServiceSettings((prev) => ({
+                ...prev,
+                ats_request_queue_concurrency: value.replace(/[^0-9]/g, "")
+              }))
+            }
+            keyboardType="numeric"
+            placeholder={String(DEFAULT_ATS_REQUEST_QUEUE_CONCURRENCY)}
+          />
+          {syncServiceSettingsLoading ? <ActivityIndicator size="small" style={styles.settingsLoader} /> : null}
+          <Text style={styles.settingsInlineHint}>
+            Range: {syncServiceSettings.min_ats_request_queue_concurrency} to{" "}
+            {syncServiceSettings.max_ats_request_queue_concurrency}. Higher values can increase throughput but may cause
+            more 429 responses.
+          </Text>
+          <Text style={styles.settingsInlineHint}>
+            Runtime is currently using {syncServiceSettings.active_ats_request_queue_concurrency}. This will take effect
+            next time you stop and restart the sync service.
+          </Text>
+        </View>
+
         {syncSettingsNotice ? <Text style={styles.settingsNotice}>{syncSettingsNotice}</Text> : null}
 
-        <Pressable onPress={handleSaveSyncSettings} style={styles.settingsSaveButton}>
-          <Text style={styles.settingsSaveButtonText}>Save Sync Settings</Text>
+        <Pressable
+          onPress={handleSaveSyncSettings}
+          disabled={syncServiceSettingsSaving}
+          style={[styles.settingsSaveButton, syncServiceSettingsSaving ? styles.settingsSaveButtonDisabled : null]}
+        >
+          <Text style={styles.settingsSaveButtonText}>{syncServiceSettingsSaving ? "Saving..." : "Save Sync Settings"}</Text>
         </Pressable>
       </View>
     </ScrollView>

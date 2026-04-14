@@ -129,6 +129,17 @@ export function saveMcpSettings(payload) {
   });
 }
 
+export function fetchSyncServiceSettings() {
+  return request("/settings/sync");
+}
+
+export function saveSyncServiceSettings(payload) {
+  return request("/settings/sync", {
+    method: "PUT",
+    body: JSON.stringify(payload || {})
+  });
+}
+
 export function fetchMcpCandidates(filters = {}) {
   const params = new URLSearchParams();
   const limit = Number(filters?.limit || 0);
