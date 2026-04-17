@@ -6184,6 +6184,7 @@ async function initDb() {
   await ensurePostingsTable();
   await ensurePersonalInformationTable();
   await ensureApplicationsTable();
+  await ensureBlockedCompaniesTable();
   await ensureSyncServiceSettingsTable();
   await loadSyncServiceSettingsIntoRuntime();
   await ensureCompaniesTableSchema();
@@ -6443,6 +6444,86 @@ async function ensureSyncServiceSettingsTable() {
     `,
     [SYNC_SERVICE_SETTINGS_DEFAULTS.ats_request_queue_concurrency]
   );
+}
+
+function normalizeCompanyNameForBlockList(value) {
+  return normalizeLikeText(value);
+}
+
+async function ensureBlockedCompaniesTable() {
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS blocked_companies (
+      normalized_company_name TEXT NOT NULL PRIMARY KEY,
+      company_name TEXT NOT NULL,
+      blocked_at_epoch INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_blocked_companies_company_name
+      ON blocked_companies(company_name);
+  `);
+}
+
+async function listBlockedCompanies() {
+  const rows = await db.all(`
+    SELECT normalized_company_name, company_name, blocked_at_epoch
+    FROM blocked_companies
+    ORDER BY company_name ASC;
+  `);
+
+  return rows.map((row) => ({
+    normalized_company_name: String(row?.normalized_company_name || ""),
+    company_name: String(row?.company_name || ""),
+    blocked_at_epoch: Number(row?.blocked_at_epoch || 0)
+  }));
+}
+
+async function blockCompanyByName(rawCompanyName) {
+  const companyName = String(rawCompanyName || "").trim();
+  const normalizedCompanyName = normalizeCompanyNameForBlockList(companyName);
+  if (!companyName || !normalizedCompanyName) {
+    throw new Error("company_name is required");
+  }
+
+  await db.run(
+    `
+      INSERT INTO blocked_companies (
+        normalized_company_name,
+        company_name,
+        blocked_at_epoch
+      ) VALUES (?, ?, ?)
+      ON CONFLICT(normalized_company_name) DO UPDATE SET
+        company_name = excluded.company_name,
+        blocked_at_epoch = excluded.blocked_at_epoch;
+    `,
+    [normalizedCompanyName, companyName, nowEpochSeconds()]
+  );
+
+  return db.get(
+    `
+      SELECT normalized_company_name, company_name, blocked_at_epoch
+      FROM blocked_companies
+      WHERE normalized_company_name = ?
+      LIMIT 1;
+    `,
+    [normalizedCompanyName]
+  );
+}
+
+async function unblockCompanyByName(rawCompanyName) {
+  const normalizedCompanyName = normalizeCompanyNameForBlockList(rawCompanyName);
+  if (!normalizedCompanyName) {
+    throw new Error("company_name is required");
+  }
+
+  const result = await db.run(
+    `
+      DELETE FROM blocked_companies
+      WHERE normalized_company_name = ?;
+    `,
+    [normalizedCompanyName]
+  );
+
+  return Number(result?.changes || 0) > 0;
 }
 
 async function getStoredSyncServiceSettings() {
@@ -6799,6 +6880,11 @@ async function listPostingsWithFilters(options = {}) {
           SELECT id, company_name, position_name, job_posting_url, posting_date, last_seen_epoch
           FROM Postings
           WHERE (? = 0 OR (posting_date IS NOT NULL AND TRIM(posting_date) <> ''))
+            AND NOT EXISTS (
+              SELECT 1
+              FROM blocked_companies b
+              WHERE b.normalized_company_name = LOWER(TRIM(Postings.company_name))
+            )
           ORDER BY ${orderByClause}
           LIMIT ? OFFSET ?;
         `,
@@ -6817,6 +6903,11 @@ async function listPostingsWithFilters(options = {}) {
               (${includeIgnored ? 0 : 1} = 1 AND COALESCE(s.ignored, 0) = 1)
             )
           WHERE (? = 0 OR (p.posting_date IS NOT NULL AND TRIM(p.posting_date) <> ''))
+            AND NOT EXISTS (
+              SELECT 1
+              FROM blocked_companies b
+              WHERE b.normalized_company_name = LOWER(TRIM(p.company_name))
+            )
             AND s.job_posting_url IS NULL
           ORDER BY ${orderByClause}
           LIMIT ? OFFSET ?;
@@ -6829,6 +6920,11 @@ async function listPostingsWithFilters(options = {}) {
       `
         SELECT id, company_name, position_name, job_posting_url, posting_date, last_seen_epoch
         FROM Postings
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM blocked_companies b
+          WHERE b.normalized_company_name = LOWER(TRIM(Postings.company_name))
+        )
         ORDER BY ${orderByClause};
       `
     );
@@ -7445,6 +7541,11 @@ async function getCompaniesForSync() {
       SELECT id, company_name, url_string, ATS_name
       FROM companies
       WHERE LOWER(TRIM(ATS_name)) IN ('workday', 'ashbyhq', 'greenhouseio', 'greenhouse.io', 'greenhouse', 'leverco', 'lever.co', 'lever', 'jobvite', 'jobvite.com', 'jobvitecom', 'applicantpro', 'applicantpro.com', 'applicantprocom', 'applytojob', 'applytojob.com', 'applytojobcom', 'theapplicantmanager', 'theapplicantmanager.com', 'theapplicantmanagercom', 'breezy', 'breezyhr', 'breezy.hr', 'breezyhrcom', 'icims', 'icims.com', 'icimscom', 'zoho', 'zohorecruit', 'zohorecruit.com', 'zohorecruitcom', 'applicantai', 'applicantai.com', 'applicantaicom', 'gem', 'jobs.gem.com', 'gem.com', 'gemcom', 'jobaps', 'jobapscloud.com', 'jobapscloudcom', 'join', 'join.com', 'joincom', 'talentreef', 'jobappnetwork.com', 'jobappnetworkcom', 'apply.jobappnetwork.com', 'applyjobappnetworkcom', 'careerplug', 'careerplug.com', 'careerplugcom', 'bamboohr', 'bamboohr.com', 'bamboohrcom', 'manatal', 'manatal.com', 'manatalcom', 'careers-page.com', 'careerspagecom', 'teamtailor', 'teamtailor.com', 'teamtailorcom', 'careerpuck', 'careerpuck.com', 'careerpuckcom', 'fountain', 'fountain.com', 'fountaincom', 'getro', 'getro.com', 'getrocom', 'hrmdirect', 'hrmdirect.com', 'hrmdirectcom', 'talentlyft', 'talentlyft.com', 'talentlyftcom', 'talexio', 'talexio.com', 'talexiocom', 'saphrcloud', 'saphrcloud.com', 'saphrcloudcom', 'jobs.hr.cloud.sap', 'jobshrcloudsap', 'recruiteecom', 'recruitee.com', 'recruitee', 'ultipro', 'ukg', 'taleo', 'taleo.net', 'taleonet')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM blocked_companies b
+          WHERE b.normalized_company_name = LOWER(TRIM(companies.company_name))
+        )
       ORDER BY ATS_name ASC, company_name ASC;
     `
   );
@@ -7907,6 +8008,55 @@ function createServer() {
       ok: true,
       item
     });
+  });
+
+  app.get("/settings/sync/blocked-companies", async (_req, res) => {
+    const items = await listBlockedCompanies();
+    res.json({
+      ok: true,
+      items,
+      count: items.length
+    });
+  });
+
+  app.post("/settings/sync/blocked-companies", async (req, res) => {
+    try {
+      const item = await blockCompanyByName(req.body?.company_name);
+      const items = await listBlockedCompanies();
+      res.json({
+        ok: true,
+        item: {
+          normalized_company_name: String(item?.normalized_company_name || ""),
+          company_name: String(item?.company_name || ""),
+          blocked_at_epoch: Number(item?.blocked_at_epoch || 0)
+        },
+        items,
+        count: items.length
+      });
+    } catch (error) {
+      res.status(400).json({
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
+  });
+
+  app.post("/settings/sync/blocked-companies/unblock", async (req, res) => {
+    try {
+      const deleted = await unblockCompanyByName(req.body?.company_name);
+      const items = await listBlockedCompanies();
+      res.json({
+        ok: true,
+        deleted,
+        items,
+        count: items.length
+      });
+    } catch (error) {
+      res.status(400).json({
+        ok: false,
+        error: String(error?.message || error)
+      });
+    }
   });
 
   app.get("/mcp/candidates", async (req, res) => {

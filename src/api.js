@@ -143,6 +143,24 @@ export function saveSyncServiceSettings(payload) {
   });
 }
 
+export function fetchBlockedCompanies() {
+  return request("/settings/sync/blocked-companies");
+}
+
+export function blockCompany(payload) {
+  return request("/settings/sync/blocked-companies", {
+    method: "POST",
+    body: JSON.stringify(payload || {})
+  });
+}
+
+export function unblockCompany(payload) {
+  return request("/settings/sync/blocked-companies/unblock", {
+    method: "POST",
+    body: JSON.stringify(payload || {})
+  });
+}
+
 export function fetchMcpCandidates(filters = {}) {
   const params = new URLSearchParams();
   const limit = Number(filters?.limit || 0);

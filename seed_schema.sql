@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS SyncServiceSettings (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- blocked_companies
+CREATE TABLE IF NOT EXISTS blocked_companies (
+  normalized_company_name TEXT NOT NULL PRIMARY KEY,
+  company_name TEXT NOT NULL,
+  blocked_at_epoch INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_blocked_companies_company_name
+  ON blocked_companies(company_name);
+
 -- application_attribution
 CREATE TABLE IF NOT EXISTS application_attribution (
       application_id INTEGER NOT NULL PRIMARY KEY,

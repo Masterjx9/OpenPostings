@@ -17,9 +17,11 @@ import {
 } from "react-native";
 import {
   API_BASE_URL,
+  blockCompany,
   createApplication,
   deleteApplication,
   fetchApplications,
+  fetchBlockedCompanies,
   fetchMcpCandidates,
   fetchMcpSettings,
   fetchPostingFilterOptions,
@@ -32,6 +34,7 @@ import {
   savePersonalInformation,
   saveSyncServiceSettings,
   triggerWorkdaySync,
+  unblockCompany,
   updateApplicationStatus
 } from "./src/api";
 
@@ -140,6 +143,13 @@ function normalizeAtsValue(value) {
   if (normalized === "ukg") return "ultipro";
   if (normalized === "taleonet" || normalized === "taleo.net") return "taleo";
   return normalized;
+}
+
+function normalizeCompanyName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
 }
 
 function getAtsDisplayLabel(value) {
@@ -350,7 +360,16 @@ function toApiMcpSettings(value) {
   };
 }
 
-function PostingCard({ item, onTrackApplication, onIgnorePosting, savingApplicationIds, ignoringPostingIds }) {
+function PostingCard({
+  item,
+  onTrackApplication,
+  onIgnorePosting,
+  onBlockCompany,
+  savingApplicationIds,
+  ignoringPostingIds,
+  blockedCompanyNames,
+  blockingCompanyNames
+}) {
   const [menuOpen, setMenuOpen] = useState(false);
   const onOpenPosting = useCallback(async () => {
     const supported = await Linking.canOpenURL(item.job_posting_url);
@@ -361,9 +380,13 @@ function PostingCard({ item, onTrackApplication, onIgnorePosting, savingApplicat
 
   const isSaving = Boolean(savingApplicationIds?.[item.job_posting_url]);
   const isIgnoring = Boolean(ignoringPostingIds?.[item.job_posting_url]);
+  const normalizedCompanyName = normalizeCompanyName(item?.company_name);
+  const isCompanyBlocked = blockedCompanyNames?.has(normalizedCompanyName);
+  const isBlockingCompany = blockingCompanyNames?.has(normalizedCompanyName);
   const isApplied = Boolean(item?.applied);
   const saveDisabled = isSaving || isApplied || isIgnoring;
   const ignoreDisabled = isIgnoring;
+  const blockDisabled = isCompanyBlocked || isBlockingCompany;
   const atsLabel = getAtsDisplayLabel(item?.ats);
 
   return (
@@ -415,6 +438,23 @@ function PostingCard({ item, onTrackApplication, onIgnorePosting, savingApplicat
                 style={[styles.postingCardMenuItem, ignoreDisabled ? styles.postingCardMenuItemDisabled : null]}
               >
                 <Text style={styles.postingCardMenuItemText}>{isIgnoring ? "Ignoring..." : "Ignore Job Posting"}</Text>
+              </Pressable>
+
+              <Pressable
+                onPress={() => {
+                  setMenuOpen(false);
+                  onBlockCompany(item);
+                }}
+                disabled={blockDisabled}
+                style={[
+                  styles.postingCardMenuItem,
+                  styles.postingCardMenuItemDestructive,
+                  blockDisabled ? styles.postingCardMenuItemDisabled : null
+                ]}
+              >
+                <Text style={[styles.postingCardMenuItemText, styles.postingCardMenuItemTextDestructive]}>
+                  {isBlockingCompany ? "Blocking company..." : isCompanyBlocked ? "Company Blocked" : "Block Company"}
+                </Text>
               </Pressable>
             </View>
           ) : null}
@@ -592,6 +632,10 @@ export default function App() {
   const [applicationsNotice, setApplicationsNotice] = useState("");
   const [savingApplicationIds, setSavingApplicationIds] = useState({});
   const [ignoringPostingIds, setIgnoringPostingIds] = useState({});
+  const [blockingCompanyNames, setBlockingCompanyNames] = useState({});
+  const [blockedCompanies, setBlockedCompanies] = useState([]);
+  const [blockedCompaniesLoading, setBlockedCompaniesLoading] = useState(false);
+  const [unblockingCompanyNames, setUnblockingCompanyNames] = useState({});
   const [updatingApplicationIds, setUpdatingApplicationIds] = useState({});
   const [deletingApplicationIds, setDeletingApplicationIds] = useState({});
   const [openApplicationStatusForId, setOpenApplicationStatusForId] = useState(null);
@@ -640,6 +684,24 @@ export default function App() {
     if (selectedStates.length === 0) return postingFilterOptions.counties || [];
     return (postingFilterOptions.counties || []).filter((county) => selectedStates.includes(county?.state));
   }, [mcpSettings.preferred_states, postingFilterOptions.counties]);
+  const blockedCompanyNames = useMemo(
+    () =>
+      new Set(
+        (blockedCompanies || [])
+          .map((item) => normalizeCompanyName(item?.company_name || item?.normalized_company_name))
+          .filter(Boolean)
+      ),
+    [blockedCompanies]
+  );
+  const blockingCompanyNamesSet = useMemo(
+    () =>
+      new Set(
+        Object.entries(blockingCompanyNames || {})
+          .filter(([, loading]) => Boolean(loading))
+          .map(([companyName]) => companyName)
+      ),
+    [blockingCompanyNames]
+  );
 
   const statusText = useMemo(() => {
     if (!status) return "No sync status yet.";
@@ -778,6 +840,23 @@ export default function App() {
     } finally {
       if (!silent) {
         setSyncServiceSettingsLoading(false);
+      }
+    }
+  }, []);
+
+  const loadBlockedCompanies = useCallback(async (options = {}) => {
+    const silent = Boolean(options.silent);
+    if (!silent) {
+      setBlockedCompaniesLoading(true);
+    }
+    try {
+      const response = await fetchBlockedCompanies();
+      setBlockedCompanies(Array.isArray(response?.items) ? response.items : []);
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      if (!silent) {
+        setBlockedCompaniesLoading(false);
       }
     }
   }, []);
@@ -959,6 +1038,63 @@ export default function App() {
       }));
     }
   }, []);
+
+  const handleBlockCompany = useCallback(
+    async (posting) => {
+      const companyName = String(posting?.company_name || "").trim();
+      const normalizedCompanyName = normalizeCompanyName(companyName);
+      if (!companyName || !normalizedCompanyName) return;
+
+      setBlockingCompanyNames((prev) => ({
+        ...prev,
+        [normalizedCompanyName]: true
+      }));
+      setError("");
+      try {
+        await blockCompany({ company_name: companyName });
+        setPostings((prev) =>
+          prev.filter((item) => normalizeCompanyName(item?.company_name) !== normalizedCompanyName)
+        );
+        await loadBlockedCompanies({ silent: true });
+        setApplicationsNotice(`Blocked "${companyName}". Postings from this company are now hidden.`);
+      } catch (e) {
+        setError(String(e.message || e));
+      } finally {
+        setBlockingCompanyNames((prev) => ({
+          ...prev,
+          [normalizedCompanyName]: false
+        }));
+      }
+    },
+    [loadBlockedCompanies]
+  );
+
+  const handleUnblockCompany = useCallback(
+    async (companyName) => {
+      const normalizedCompanyName = normalizeCompanyName(companyName);
+      if (!normalizedCompanyName) return;
+
+      setUnblockingCompanyNames((prev) => ({
+        ...prev,
+        [normalizedCompanyName]: true
+      }));
+      setError("");
+      try {
+        await unblockCompany({ company_name: companyName });
+        await loadBlockedCompanies({ silent: true });
+        await loadPostings(searchRef.current, { silent: true, filters: postingsFiltersRef.current });
+        setApplicationsNotice(`Unblocked "${companyName}".`);
+      } catch (e) {
+        setError(String(e.message || e));
+      } finally {
+        setUnblockingCompanyNames((prev) => ({
+          ...prev,
+          [normalizedCompanyName]: false
+        }));
+      }
+    },
+    [loadBlockedCompanies, loadPostings]
+  );
 
   const handleUpdateApplicationStatus = useCallback(async (applicationId, nextStatus) => {
     setUpdatingApplicationIds((prev) => ({
@@ -1150,6 +1286,7 @@ export default function App() {
           loadStatus(),
           loadPersonalInformation(),
           loadSyncServiceSettings(),
+          loadBlockedCompanies(),
           loadMcpSettings(),
           loadPostingFilterOptions(),
           loadApplications()
@@ -1167,6 +1304,7 @@ export default function App() {
     loadStatus,
     loadPersonalInformation,
     loadSyncServiceSettings,
+    loadBlockedCompanies,
     loadMcpSettings,
     loadPostingFilterOptions,
     loadApplications
@@ -1370,8 +1508,11 @@ export default function App() {
               item={item}
               onTrackApplication={handleTrackPostingApplication}
               onIgnorePosting={handleIgnorePosting}
+              onBlockCompany={handleBlockCompany}
               savingApplicationIds={savingApplicationIds}
               ignoringPostingIds={ignoringPostingIds}
+              blockedCompanyNames={blockedCompanyNames}
+              blockingCompanyNames={blockingCompanyNamesSet}
             />
           )}
           ListEmptyComponent={<Text style={styles.empty}>No postings found.</Text>}
@@ -1588,6 +1729,34 @@ export default function App() {
             Runtime is currently using {syncServiceSettings.active_ats_request_queue_concurrency}. This will take effect
             next time you stop and restart the sync service.
           </Text>
+        </View>
+
+        <View style={styles.formGroup}>
+          <Text style={styles.fieldLabel}>Blocked companies</Text>
+          <Text style={styles.settingsInlineHint}>
+            Blocked companies are hidden from Postings and excluded from sync collection.
+          </Text>
+          {blockedCompaniesLoading ? <ActivityIndicator size="small" style={styles.settingsLoader} /> : null}
+          {!blockedCompaniesLoading && blockedCompanies.length === 0 ? (
+            <Text style={styles.settingsInlineHint}>No blocked companies.</Text>
+          ) : null}
+          {blockedCompanies.map((company) => {
+            const companyName = String(company?.company_name || company?.normalized_company_name || "").trim();
+            const normalizedCompanyName = normalizeCompanyName(companyName);
+            const isUnblocking = Boolean(unblockingCompanyNames[normalizedCompanyName]);
+            return (
+              <View key={`blocked-${normalizedCompanyName}`} style={styles.blockedCompanyRow}>
+                <Text style={styles.blockedCompanyName}>{companyName || "Unknown company"}</Text>
+                <Pressable
+                  onPress={() => handleUnblockCompany(companyName)}
+                  disabled={isUnblocking}
+                  style={[styles.blockedCompanyUnblockBtn, isUnblocking ? styles.blockedCompanyUnblockBtnDisabled : null]}
+                >
+                  <Text style={styles.blockedCompanyUnblockBtnText}>{isUnblocking ? "Unblocking..." : "Unblock"}</Text>
+                </Pressable>
+              </View>
+            );
+          })}
         </View>
 
         {syncSettingsNotice ? <Text style={styles.settingsNotice}>{syncSettingsNotice}</Text> : null}
@@ -2303,6 +2472,10 @@ const styles = StyleSheet.create({
     marginBottom: 6,
     backgroundColor: "#f8fafc"
   },
+  postingCardMenuItemDestructive: {
+    borderColor: "#f4d4d4",
+    backgroundColor: "#fff4f4"
+  },
   postingCardMenuItemDisabled: {
     opacity: 0.6
   },
@@ -2310,6 +2483,9 @@ const styles = StyleSheet.create({
     color: "#334e68",
     fontWeight: "600",
     fontSize: 12
+  },
+  postingCardMenuItemTextDestructive: {
+    color: "#a12d2d"
   },
   postingCardActionSaveDisabled: {
     opacity: 0.65
@@ -2488,6 +2664,41 @@ const styles = StyleSheet.create({
     marginTop: 6,
     fontSize: 11,
     color: "#52606d"
+  },
+  blockedCompanyRow: {
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: "#dbe2ea",
+    borderRadius: 10,
+    backgroundColor: "#f8fafc",
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10
+  },
+  blockedCompanyName: {
+    flex: 1,
+    color: "#334e68",
+    fontSize: 12,
+    fontWeight: "600"
+  },
+  blockedCompanyUnblockBtn: {
+    borderWidth: 1,
+    borderColor: "#0b6e4f",
+    borderRadius: 8,
+    backgroundColor: "#0b6e4f",
+    paddingVertical: 7,
+    paddingHorizontal: 10
+  },
+  blockedCompanyUnblockBtnDisabled: {
+    opacity: 0.65
+  },
+  blockedCompanyUnblockBtnText: {
+    color: "#ffffff",
+    fontSize: 12,
+    fontWeight: "700"
   },
   settingsSaveButton: {
     marginTop: 10,
