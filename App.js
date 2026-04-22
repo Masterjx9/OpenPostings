@@ -755,6 +755,8 @@ export default function App() {
   const postingsRefreshInFlightRef = useRef(false);
   const lastPostingRefreshAtRef = useRef(0);
   const wasSyncRunningRef = useRef(false);
+  const postingsRequestSequenceRef = useRef(0);
+  const applicationsRequestSequenceRef = useRef(0);
 
   const pageTitle = PAGE_TITLES[activePage] || PAGE_TITLES[PAGE_KEYS.POSTINGS];
   const remoteFilterOptions = useMemo(
@@ -847,18 +849,25 @@ export default function App() {
   const loadPostings = useCallback(async (q, options = {}) => {
     const silent = Boolean(options.silent);
     const filters = options.filters || postingsFiltersRef.current;
+    const requestSequence = postingsRequestSequenceRef.current + 1;
+    postingsRequestSequenceRef.current = requestSequence;
     if (!silent) {
       setLoading(true);
     }
     setError("");
     try {
       const response = await fetchPostings(q, 1000, 0, filters);
+      if (requestSequence !== postingsRequestSequenceRef.current) {
+        return;
+      }
       setPostings(response.items || []);
       lastPostingRefreshAtRef.current = Date.now();
     } catch (e) {
-      setError(String(e.message || e));
+      if (requestSequence === postingsRequestSequenceRef.current) {
+        setError(String(e.message || e));
+      }
     } finally {
-      if (!silent) {
+      if (!silent && requestSequence === postingsRequestSequenceRef.current) {
         setLoading(false);
       }
     }
@@ -885,21 +894,34 @@ export default function App() {
 
   const loadApplications = useCallback(async (options = {}) => {
     const silent = Boolean(options.silent);
+    const requestSequence = applicationsRequestSequenceRef.current + 1;
+    applicationsRequestSequenceRef.current = requestSequence;
     if (!silent) {
       setApplicationsLoading(true);
     }
     try {
       const response = await fetchApplications(1000, 0);
+      if (requestSequence !== applicationsRequestSequenceRef.current) {
+        return;
+      }
       const items = Array.isArray(response?.items) ? response.items : [];
       setApplications(items.map(normalizeApplicationItem).filter((item) => item.id > 0));
     } catch (e) {
-      setError(String(e.message || e));
+      if (requestSequence === applicationsRequestSequenceRef.current) {
+        setError(String(e.message || e));
+      }
     } finally {
-      if (!silent) {
+      if (!silent && requestSequence === applicationsRequestSequenceRef.current) {
         setApplicationsLoading(false);
       }
     }
   }, []);
+
+  const handleOpenApplicationsPage = useCallback(() => {
+    setActivePage(PAGE_KEYS.APPLICATIONS);
+    setDrawerOpen(false);
+    loadApplications({ silent: false });
+  }, [loadApplications]);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -1097,7 +1119,7 @@ export default function App() {
       }));
       setError("");
       try {
-        await createApplication({
+        const response = await createApplication({
           company_name: posting.company_name,
           position_name: posting.position_name,
           job_posting_url: posting.job_posting_url,
@@ -1106,20 +1128,21 @@ export default function App() {
           applied_by_type: "manual",
           applied_by_label: "Manually applied by user"
         });
+        postingsRequestSequenceRef.current += 1;
         setPostings((prev) =>
-          prev.map((item) =>
-            item.job_posting_url === postingKey
-              ? {
-                  ...item,
-                  applied: true,
-                  applied_by_type: "manual",
-                  applied_by_label: "Manually applied by user"
-                }
-              : item
-          )
+          prev.filter((item) => String(item?.job_posting_url || "").trim() !== postingKey)
         );
+        lastPostingRefreshAtRef.current = Date.now();
+        const createdApplication = normalizeApplicationItem(response?.item);
+        if (createdApplication.id > 0) {
+          applicationsRequestSequenceRef.current += 1;
+          setApplications((prev) => {
+            const remaining = prev.filter((item) => item.id !== createdApplication.id);
+            return [createdApplication, ...remaining];
+          });
+        }
         setApplicationsNotice(`Saved "${posting.position_name}" to Applications.`);
-        await loadApplications({ silent: true });
+        await loadApplications({ silent: false });
       } catch (e) {
         setError(String(e.message || e));
       } finally {
@@ -1147,7 +1170,10 @@ export default function App() {
         ignored: true,
         ignored_by_label: "Ignored by user"
       });
-      setPostings((prev) => prev.filter((item) => item.job_posting_url !== postingKey));
+      postingsRequestSequenceRef.current += 1;
+      setPostings((prev) =>
+        prev.filter((item) => String(item?.job_posting_url || "").trim() !== postingKey)
+      );
       setApplicationsNotice(`Ignored "${posting.position_name}".`);
     } catch (e) {
       setError(String(e.message || e));
@@ -2361,7 +2387,7 @@ export default function App() {
             <DrawerItem
               label="Applications"
               selected={activePage === PAGE_KEYS.APPLICATIONS}
-              onPress={() => navigateToPage(PAGE_KEYS.APPLICATIONS)}
+              onPress={handleOpenApplicationsPage}
             />
 
             <Text style={styles.drawerHeading}>Settings</Text>
